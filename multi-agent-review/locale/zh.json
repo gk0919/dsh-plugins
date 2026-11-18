@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "多 Agent 代码审查",
+    "description": "由业务逻辑、安全健壮性、测试三个独立子 Agent 并行只读审查当前 Git 改动，汇总成含 Agent ID、失败项、证据与分歧的报告。"
+  }
+}

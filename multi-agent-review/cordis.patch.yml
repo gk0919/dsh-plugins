@@ -1,0 +1,12 @@
+# Inserts the read-only multi-agent code-review tool.
+# The plugin declares no Config schema, so these values are read from `config` as-is.
+- insert:
+    - id: multi-agent-review
+      name: '@local/multi-agent-review'
+      config:
+        provider: spawn
+        toolName: code_review
+        maxConcurrent: 3
+        timeoutMs: 600000
+        commandTimeoutMs: 30000
+        maxDiffBytes: 150000

@@ -1,0 +1,45 @@
+{
+  "name": "@local/agent-workflow-control",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Human-approved agent-workflow file capabilities for a dedicated DSH profile",
+  "main": "./dist/src/index.js",
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.19",
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/test/plugin.test.js",
+    "test:dsh": "node --test dist/test/dsh.test.js"
+  },
+  "dependencies": {
+    "@gk0919/agent-workflow": "file:../../agent-workflow"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

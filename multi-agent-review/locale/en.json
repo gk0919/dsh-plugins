@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Multi-agent code review",
+    "description": "Reviews the current Git changes read-only with independent business-logic, security, and test reviewers, then returns one report with agent IDs, failures, evidence, and disagreements."
+  }
+}
