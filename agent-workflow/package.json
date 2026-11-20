@@ -1,14 +1,26 @@
 {
   "name": "@local/agent-workflow-control",
-  "version": "0.2.0",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "description": "Human-approved agent-workflow file capabilities for a dedicated DSH profile",
   "main": "./dist/src/index.js",
   "exports": {
-    ".": "./dist/src/index.js"
+    ".": "./dist/src/index.js",
+    "./client": "./dist/client.js"
   },
   "dsh": {
+    "client": {
+      "platform": "web",
+      "external": [
+        "react"
+      ],
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
@@ -19,27 +31,30 @@
   },
   "files": [
     "dist",
+    "client",
     "cordis.patch.yml"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm check && tsdown",
+    "bundle": "node scripts/bundle.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/test/plugin.test.js",
+    "test": "node --test test/deployment.test.mjs test/startup.test.mjs test/lifecycle.test.mjs dist/test/plugin.test.js",
     "test:dsh": "node --test dist/test/dsh.test.js"
   },
   "dependencies": {
     "@gk0919/agent-workflow": "file:../../agent-workflow"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0"
+    "@deepseek-ai/dsh-session": ">=0.2.2-rc.3 <0.3.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.3",
     "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.3",
     "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.3",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
     "@types/node": "^24.0.0",
+    "tsdown": "0.23.7",
     "typescript": "^5.9.0"
   }
 }

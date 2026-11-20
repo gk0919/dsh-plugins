@@ -1,124 +1,192 @@
 # DSH 受控工作流插件
 
-这是第一版可运行适配器。人工 `/workflow` 命令直接调用代码，模型通过专用工具读取、
-撰写任务文档和提交变更。任务阶段、先决条件、检查点与验证合同仍由 `agent-workflow` 管理。
+当前插件版本为 0.9.3。插件把 `agent-workflow` Core 的状态投射成受控工具和暂停状态，**Core 是唯一状态机**：
 
-代码写入必须同时满足：Core 处于 Implement、人工批准当前 proposal、方案和仓库基线未变、
-文件处于批准范围且前像哈希一致。每次批准只能提交一批变更；方案变化或恢复后重新批准。
-这能强制工具权限和门禁顺序，不能自动证明 AI 的分析正确、代码充分必要或审查结论可靠。
+0.9.3 修复 Implement 证据重试：代码已写入状态不会因提交失败丢失，补交证据无需再次批准。
+已批准的计划定义在写入文档前受校验；确需修改时，先用 `changes-required` 返回 Plan 生成新提案。
+
+小修改使用 `workflow_apply({changes:[{path,edits:[{oldText,newText}]}]})`，原文须唯一精确匹配，
+多处编辑基于批准的原文件且不重叠。新增文件用 `{path,content}`，删除用 `content:null`，可同批混用。
+Core 负责完整文件写入，无需人工补丁或让模型重写大文件；一次批准仍只允许一批。
+
+0.9.1 修复多文档提交：整批预校验后发布一个检查点；简报直接列出当前阶段 items 和允许文档名。
+Source Capture 复用已捕获来源，普通暂停用 continue，只有基线冲突才考虑 reconcile。
+
+1. `workflow_stage` / `workflow_submit` 只在拥有受控任务的会话里存在（条件注册），模型用它们读取
+   Core 的阶段简报、提交本阶段产物与证据；
+2. `agent/turn-stopping` 里查一次 Core：当前阶段没提交就用 `agent.steer()` 重开回合，每阶段最多 5 次，
+   模型无法在阶段未推进时安静收尾；
+3. `tools.guard` 让代码仓库始终不接受原生 write/edit 或 Shell：文档只能写到私有暂存目录，批准后的代码只能通过 `workflow_apply` 进入 Core 的精确前像校验和一次性批准。
+
+阶段、门禁、检查点、证据校验与验证合同全部由 Core 决定；插件不生产内容。
+模型全程在同一份上下文里逐阶段推进：文档写到 `os.tmpdir()/dsh-workflow/<task-id>/`，由插件读入后
+交给 `controller.artifact()` 落盘；Implement 阶段模型用 `workflow_apply` 提交局部编辑或完整文件内容，Verify 由 Core 固定检查器执行。
+这能强制顺序、范围与人工批准点，不能自动证明分析正确、代码充分或审查可靠。
 
 ## 安装
 
-适配 DSH `0.2.2-rc.3`（`engines.dsh: >=0.2.2-rc.3 <0.3.0`），需要支持 `tools.guard()` 的 Host。
-宿主启用 Node 22.19+。插件源码为 TypeScript，`pnpm install` 后 `pnpm build` 产出 `dist/`；
-Host 加载 `dist/src/index.js`，`@deepseek-ai/*` 由运行中的 DSH 安装解析，不在本包内重复安装。
-本目录依赖同级上层仓库 `../../agent-workflow`，需要先构建新增公开 `/control` 接口：
+适配 DSH `0.2.2-rc.3`（`engines.dsh: >=0.2.2-rc.3 <0.3.0`），需要支持 `tools.guard()`、
+条件工具注册与 `agent/turn-stopping` 事件的 Host。插件源码为 TypeScript，`pnpm install` 后
+`pnpm build` 产出 `dist/`；
+Host 加载 `dist/src/index.js`，`@deepseek-ai/*` 由运行中的 DSH 安装解析。
+Node 端与浏览器端统一使用 tsdown 构建，类型检查保留 `tsc --noEmit`。
+浏览器入口 `dist/client.js` 打包为 DSH ModuleLoader 工厂，React 使用宿主实例；Node 端保留目录结构，Core 与 DSH 依赖由运行环境解析。
+源码构建需 Node.js 22.19+（22.x）、24.11+（24.x）或 26+。
+本目录依赖同级上层仓库 `../../agent-workflow`，需要先构建公开 `/control` 接口：
 
 ```powershell
 cd D:\Project\agent-workflow
 npm ci
 npm run build
 cd D:\Project\dsh-plugins\agent-workflow
-pnpm install
+pnpm install --force --ignore-scripts
 pnpm check
 pnpm build
 pnpm test
-pnpm test:dsh
 ```
 
 生产分发时应把 `file:` 依赖换成包含 `/control` 接口的正式包版本；当前未发布该版本。
 插件导入公开 package export，不导入 Core `src/`，也不会自动修改业务仓库的依赖或配置。
 
-在 **独立 DSH Profile** 中通过 Plugins → Add plugin 选择本目录，或使用 DSH 的本地 bundle
-安装方式。bundle 的 `cordis.patch.yml` 注册插件，安装后在新会话使用。
-该 Profile 必须挂载 **native** 工具执行器（`@deepseek-ai/dsh-tool-executor-native`），
-不要挂载 PTC 执行器：0.2.2-rc.3 已移除 tools 插件的 `config.mode`，执行器改由插件决定。
-插件会拒绝 `run_code`，ptc 模式下模型无法调用这些专用工具。
-
+在 **独立 DSH Profile** 中通过 Plugins → Add plugin 选择本目录，或使用 DSH 的本地 bundle 安装方式。
+bundle 的 `cordis.patch.yml` 注册插件，安装后在新会话使用。
+该 Profile 必须挂载 **native** 工具执行器（`@deepseek-ai/dsh-tool-executor-native`），不要用 PTC 执行器。
+插件依赖 `tools.guard()`、`ctx.tools.register(def, { when })`、`agent/turn-stopping` 事件与
+`agent.steer()`；`/workflow doctor` 会报告这些能力是否可用。
 该 Profile 必须使用固定可信插件组合，禁止模型卸载/热重载 guard 或修改部署文件。
-插件/Core 代码与部署配置应放在模型工作区之外并设为只读。插件卸载以后 DSH 会撤销 guard，
-因此不能把“可由模型管理插件的普通 Profile”当作隔离环境。
 
-插件的全局 guard 对此 Profile 中所有 Agent 生效：只放行本插件的 `workflow_*` 名称，
-其余 shell、编辑、MCP、子代理、插件管理、任意代码执行以及未来新增工具均被拒绝。
-未绑定任务的 Agent 也无法使用这些专用工具。不要在日常通用 Profile 直接启用。
+## 阶段推进与停止点
+
+Web/桌面客户端加载本插件的 `./client` 入口后，`/workflow run*` 会在进度卡上显示启动与 Core 进度。
+进度是可忽略的 plugin record，进入进度卡但不进入模型上下文，也不授予权限；纯 Host/TUI 不含这张卡片。
+
+真正的阶段推进靠会话内的注入：`/workflow run*` 创建任务后，插件用 `agent.steer()` 把首个阶段简报
+送进对话（任务、阶段、Core Route Packet、任务目录、暂存目录与提交要求）。模型做完本阶段、用
+`workflow_submit` 提交后，工具结果里直接带下一阶段简报；若模型想收尾，`agent/turn-stopping` 会
+再注入一次提醒。到实施批准点插件不再 steer，命令返回阶段摘要与下一步；失败也直接作为命令错误显示。
+期间按界面停止键即可中断，之后用 `/workflow status` 查看落点、`/workflow resume <task-id>` 继续。
 
 ## 使用
 
 先在已有 `.agent-workflow/config.json`、AGENTS.md 和至少一个 Git 提交的工作区打开新会话。
-工作区路径必须是仓库根目录，tasksRoot 目录须已初始化。业务需求选用项目实际 Route、Entry
-和 Source Type，不能为省略业务门禁套用 maintenance。
+工作区路径必须是仓库根目录，tasksRoot 目录须已初始化。
 
 ```text
-/workflow help
-/workflow start {"taskId":"example-task","route":"task-workflow-maintenance","entry":"not-applicable","goal":"调整工作流配置"}
+/workflow run D:\Downloads\request.md
+/workflow lookup <精确需求或缺陷编号>
+/workflow run <精确需求或缺陷编号>
+/workflow run-defect D:\Downloads\bug.md
+/workflow run-requirement D:\Downloads\request.md
+/workflow run-maintenance D:\Downloads\maintenance.md
 ```
 
-业务任务的 start 还可传 `sourceType`、`sourceText`、`sourceId`，由 Core 校验有效性。
-来源快照在初始化时由宿主记录，后续模型不能修改。已有任务用：
+`lookup` 仅返回编号详情和识别类型，不创建任务、不替换当前任务、不调度模型。
+`run` 查询后创建任务，按 Provider 的类型识别需求或缺陷；显式 run-defect/run-requirement
+若与查询结果冲突则拒绝。编号规则由 Active Profile 的 Source Provider 管理，Core 保持通用。
+文档路径可含空格，命令后的整段文本直接作为路径，不加引号。
+
+模型每阶段先用 `workflow_stage` 读简报（包含 stateToken、规范影响和依赖状态），按包里的产物格式与
+证据要求把本阶段文档写到暂存目录，再调用：
 
 ```text
-/workflow resume example-task
+workflow_submit({ stateToken, files, evidence, items, verdict: "ready", reason })
 ```
 
-然后告诉模型：**“先调用 workflow_context，按当前阶段分析并撰写任务方案，提交 proposal 后等待我批准。”**
-人工命令输出显示在命令面板；它不会伪装成用户消息自动驱动模型继续。
+`files` 是暂存目录里的任务文档相对路径；`items` 必须精确覆盖 `plan.md` 中本阶段全部未完成工作项；
+`evidence` 形如 `prd.md#Summary`。插件读入文档后调用 `controller.artifact()`，再调用
+`controller.submit()`；Core 拒绝时错误原样回到模型，按提示修正后重交。Plan 阶段额外给出
+`summary` 与 `planFiles`（要修改的仓库相对路径），插件提交 proposal 后停下。
 
-模型工具：
-
-| 工具 | 能力 |
-|---|---|
-| `workflow_status` | 当前阶段、完整 Core plan、proposal、是否仍有有效批准 |
-| `workflow_context` | 由 Core `workflow:next` 物化当前 Route Packet |
-| `workflow_list` | 列目录，单次最多 1000 项，不递归链接 |
-| `workflow_read` | 读取 UTF-8 文本和精确 SHA-256，单文件最多 4 MiB |
-| `workflow_diff` | 固定的 Git status、相对 HEAD 的 diff 和未跟踪文件列表；无 Git 写入 |
-| `workflow_artifact` | 撰写允许的任务文档；verification.json 只能写未执行的定义 |
-| `workflow_propose` | summary + 1–100 个明确文件路径，绑定 Core plan 与当前基线 |
-| `workflow_apply` | proposalId + 一批完整文件文本与 beforeHash，校验后落盘 |
-
-人工查看方案和范围后，使用 proposal 的完整 ID 批准：
+实施前人工核对完整 plan、summary、文件范围、前像：
 
 ```text
 /workflow status
-/workflow approve <完整 proposal ID>
+/workflow status --json
+/workflow approve
 ```
 
-批准命令会执行 Core 原有 Implement 入口门禁。若仍处于尚未完成的前置阶段，不会跳过阶段；
-先完成该阶段产物并通过已有任务 CLI 推进。之后告诉模型继续，它便可提交已批准的变更。
-create 用 `beforeHash: null`，delete 用 `content: null`；新建文件的父目录必须已存在。
-不支持二进制、路径链接、跨仓库批次、自动建目录或无限制 shell。
+默认 status 展示阶段、权限、proposal、完整文件范围与前像、完整计划和下一步；`--json` 保留完整机器状态。
+`approve` 只批准当前提案（也可显式给 id）。批准后只显示 `workflow_apply({ changes })`；原生 write/edit 与 Shell 仍关闭，Core 负责前像、范围、一次性批准和固定检查器。
+当前没有图形批准按钮。既有任务用 `/workflow resume <task-id>`，恢复进度但不继承批准状态。
+`/workflow pause` 持久化暂停并解除钩子；`/workflow continue` 人工解除普通暂停，仍需重新批准写入。
 
-修改任务状态由人工调用现有 CLI 语义，argv 必须是 JSON 字符串数组：
+## 固定构件与部署诊断
+
+开发仓库仍使用 `file:../../agent-workflow`。两仓库构建和检查通过后运行 `npm run bundle`，
+在本仓库 `build/agent-workflow-<版本>-<标识>/` 生成独立部署目录：已编译插件、Core 的 core.tgz、
+本地包依赖、固定版本 MCP client、静态检查器示例和 SHA256SUMS。构件保存当时的字节快照，不再引用开发源码。
+该命令不构建、不安装、不发布，也不修改运行 Profile；只打包已经检查过的输出。
+
+在生成目录执行 `pnpm install --prod --ignore-scripts`，再按 DSH 本地 bundle 方式选择该目录。
+peer 依赖继续由 DSH 提供；`pnpm-workspace.yaml` 的 autoInstallPeers=false 禁止自动安装另一份 DSH。
+校验摘要用于核对构件，不等于签名或保证可重复构建。
 
 ```text
-/workflow task ["item","--item","T1","--status","complete","--evidence","changes.md#Implementation","--expected-revision","<当前 revision>","--reason","已核对差异"]
-/workflow task ["advance","--to","Review","--expected-last-updated","<当前 lastUpdated>","--evidence","changes.md#Implementation","--action","执行代码审查"]
-/workflow pause
+/workflow doctor
 ```
 
-具体必需参数遵循当前 Core CLI；失败按错误修正，不自动重试或跳过门禁。
-`task` 操作、暂停、resume、重启、文档修改、方案变化都会撤销当前代码写权限。
-如仓库有外部改动，先人工 Inspect，再通过 `task checkpoint --reconcile` 更新观察检查点，
-重新 proposal 和批准。旧测试结果仍按 Core 的 current/stale/unknown 规则处理。
+无需先绑定任务。报告插件/Core/Node 版本、Profile、Provider 名称、Git 根、任务目录、runtime
+忽略规则、可用 Skill、检查器 ID、guard、条件工具与 turn-stopping 可用性；不输出凭据或完整配置，不查询远端，
+不创建任务或目录。宿主契约没有暴露 DSH 版本和实际执行器，doctor 会明确要求人工确认。
+
+## 重复请求与中断恢复
+
+V3 对阶段提交和文件批次生成稳定操作编号，回执保存在项目 runtimeRoot/control-operations 下。
+该目录必须被 Git 忽略；回执独立于任务与授权基线，只负责去重，不授予权限。保留该目录才能跨重启去重。
+相同请求重复到达时返回已有回执，不再次推进或写入；阶段重放返回当前状态，避免旧 Packet 驱动新工作。
+
+`status` 输出 nextAction、recovery、taskDirectory。恢复时区分：等待批准、已写入待补证据、普通暂停、
+仓库/产物待 reconcile，以及尚无回执的不明操作。已写入且有回执的批次可继续阶段证据，不继承新写权限。
+审批前的阶段屏障也会持久保留，resume 和 continue 均不会绕过。
+
+存在不明操作时先核对 status/diff 和实际文件。若代码/产物未发布：
+
+```text
+/workflow task ["checkpoint","--reconcile","--expected-revision","<status中的revision>","--reason","已人工核对部分写入和任务证据"]
+/workflow recover
+```
+
+recover 只承认已核对的现场并解除屏障，不重做旧请求、不回滚、不恢复旧批准。
+正在写入的锁不能绕过；残留锁必须先确认没有存活执行者。
+
+## 固定检查器
+
+插件仅执行可信部署配置的 `checks`。默认没有检查器，Verify 保持未验证并返回缺口；
+不会猜测或运行业务项目的构建/测试。部署者必须遵守目标项目 AGENTS，禁止测试的项目只配置允许的静态检查。
+
+```yaml
+checks:
+  - id: static-check
+    command: 'C:\Program Files\nodejs\node.exe'
+    args: ['D:\trusted-checkers\check-source.mjs']
+    timeoutMs: 30000
+    testId: VT1
+maxCorrections: 2
+```
+
+有 verification.json 时，testId 必须绑定 executor=agent、method=static/cli 的测试点。
+Core 先登记执行基线，再运行固定命令，按真实退出结果写入独立证据并执行 verify-record；
+代码或任务基线被检查器修改时拒绝登记通过。一次失败返回修正 Packet，连续失败达到 Core 预算后持久化暂停。
+Review/Verify 返回 `changes-required` 时要求有效发现证据与具体原因，Core 回到 Plan 并重置受影响工作项，
+方案修订后必须重新 proposal 和人工批准。
+
+可选的 `deploy/check-changed-js.mjs` 只对当前 Git 仓库中相对 HEAD 的变更和未跟踪 JavaScript
+运行 `node --check`，不导入/执行业务代码，不触发构建或测试。它不覆盖嵌套独立仓库、TypeScript、
+浏览器或业务行为；使用 `deploy/checks.example.yml` 时替换绝对路径。
 
 ## 验证与边界
 
-- `pnpm test`：命令适配层测试，覆盖参数校验、会话隔离、伪造批准、pause、恢复、一次性批准和卸载。
-- `pnpm test:dsh`：使用真实 Cordis 4.1 + DSH Tools `0.2.2-rc.3`（含 native 执行器插件）注册
-  Schema 并执行工具管线，验证最后一道 guard 不能被后续 allow 监听器覆盖，禁用能力的工具体没有执行。
-  人工命令/UI transport 是测试夹具；尚未在 DSH 图形界面安装并做模型端到端验收。
-- Core 的 `quality:policy` 包含真实临时 Git 仓库、真实任务阶段/产物门禁、批准/重放、
-  外部改动、范围/前像、链接/硬链接、路径和跨 controller 写锁回归。
+- `pnpm check`：`tsc --noEmit`，不构建。
+- `pnpm test`：部署检查器、浏览器 client 入口和插件 guard/命令适配层测试；需要先 `pnpm build`。
+- Core 的 `quality:policy` 包含真实临时 Git 仓库、任务阶段/产物门禁、批准/重放、外部改动、
+  范围/前像、写锁与部分写入恢复的回归。
+- 尚未在图形界面做模型端到端验收。
 
-第一版不自动运行测试、浏览器审查或 CI。验证由人工/CI 在宿主规则允许的环境执行，
-通过 Core `verify-begin` / `verify-record` 登记基线和证据；没有证据时保持未验证。
-证据文件由可信人工/runner 写入，模型不能通过 `workflow_artifact` 伪造结构化通过状态。
-文档里的自然语言“通过”仍需人工核实，不能替代结构化证据。
-
-这是 DSH 工具管线的强制边界，不是 OS 沙箱。绕开共享管线的第三方执行器、可修改部署的
-同机进程、人工通过其它终端写入以及插件卸载均在保证范围外。严格隔离仍需叠加受限账户、
-容器或沙箱。多文件写入不是事务：遇到部分写入或检查点失败，保留差异并人工核对，不能盲重试。
-宿主必须在插件激活失败时停止启动模型任务；插件没有成功加载时，其自身无法替宿主维持 guard。
+这是 DSH 工具管线的强制边界，不是 OS 沙箱。绕开共享管线的第三方执行器、可修改部署的同机进程、
+人工通过其它终端写入以及插件卸载均在保证范围外。多文件写入不是事务：遇到部分写入或检查点失败，
+保留差异并人工核对，不能盲重试。宿主必须在插件激活失败时停止启动模型任务。
 
 Core API 和失败恢复细节见 `D:\Project\agent-workflow\docs\host-control.md`。
+V4 实际部署验收步骤见 [deploy/ACCEPTANCE.md](deploy/ACCEPTANCE.md)。
+
+`/workflow spec-init {"baselines":[".agent-workflow/specs/export.json"],"capabilities":[]}` 捕获明确规范基线；`/workflow spec-impact` 查看原规则、新规则、场景、AC/VT 和依赖阻塞；`/workflow pause` 保留任务绑定并记录原因。

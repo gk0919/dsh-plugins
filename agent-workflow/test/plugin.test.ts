@@ -1,78 +1,68 @@
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import test from 'node:test'
 import path from 'node:path'
-import { apply } from '../src/index.js'
-import type { CommandDefinition, ToolGuard, WorkflowHost } from '../src/index.js'
-import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { workspace, start, plan } from './fixture.js'
+import { mkdtempSync, rmSync, linkSync, writeFileSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { precheck } from '../src/index.js'
+import { DENIED, decide, inside } from '../src/tool-access.js'
 
-test('command authority, per-agent state, schema validation, revocation and disposal', async () => {
-  const fixture = workspace()
-  const tools = new Map<string, ToolDefinition>(), commands = new Map<string, CommandDefinition>()
-  let guard: ToolGuard | undefined
-  const ctx: WorkflowHost = {
-    tools: {
-      register: (tool) => { tools.set(tool.name, tool); return () => { tools.delete(tool.name) } },
-      guard: (value) => { guard = value; return () => { guard = undefined } },
-    },
-    commands: { register: (command) => { commands.set(command.name, command); return () => { commands.delete(command.name) } } },
-    effect: (setup) => setup(),
-    workingDirectory: { ensure: async () => fixture.root },
+const workspace = path.resolve('/repo')
+const staging = realpathSync(mkdtempSync(path.join(tmpdir(), 'workflow-policy-')))
+const locked = { workspace, staging, paused: false }
+process.on('exit', () => rmSync(staging, { recursive: true, force: true }))
+
+test('a session without a controlled task is untouched', () => {
+  assert.equal(decide({ name: 'bash' }, undefined), undefined)
+})
+
+test('reads, host plumbing and the stage tools stay available while locked', () => {
+  for (const name of ['read', 'grep', 'workflow_stage', 'workflow_submit', 'structured_output']) {
+    assert.equal(decide({ name }, locked), undefined, name)
   }
-  const dispose = apply(ctx)
-  const agent = { id: 'parent' }, stranger = { id: 'stranger' }
-  const signal = new AbortController().signal
-  const command = (rawInput: string, caller = agent) => commands.get('workflow')!.handler({ agent: caller, rawInput, signal })
-  const call = async (name: string, args: Record<string, unknown> = {}, caller = agent): Promise<any> =>
-    tools.get(name)!.execute(args, { agent: caller, signal } as unknown as ToolRunContext)
-  try {
-    for (const name of ['shell', 'exec', 'apply_patch', 'plugin_manager', 'mcp', 'subagent', 'run_code', 'unknown']) assert.ok(guard!({ name, agent }))
-    assert.ok(guard!({ name: 'workflow_read' }))
-    assert.equal(guard!({ name: 'workflow_read', agent }), undefined)
-    await assert.rejects(call('workflow_read', { path: 'code.txt' }), /start/)
-    assert.equal((await command(start)).kind, 'success')
-    await assert.rejects(call('workflow_read', { path: 'code.txt' }, stranger), /start/)
-    await assert.rejects(call('workflow_read', { path: 'code.txt', approved: true }), /additional|unexpected|approved/i)
-    await assert.rejects(call('workflow_apply', { proposalId: 'fake', changes: [{ path: 'code.txt', beforeHash: null, content: 'bad' }], userApproved: true }))
-    assert.equal((await command('task ["--task","different-task"]')).kind, 'error')
-    await call('workflow_artifact', { file: 'changes.md', content: '# Changes\n\n## Implementation\nAdd one approved line.\n' })
-    await call('workflow_artifact', { file: 'plan.md', content: plan })
-    const before = await call('workflow_read', { path: 'code.txt' })
-    let proposal = await call('workflow_propose', { summary: 'Add one line', paths: ['code.txt'] })
-    assert.equal((await command(`approve ${proposal.id}`)).kind, 'success')
-    assert.equal((await command('pause')).kind, 'success')
-    await assert.rejects(call('workflow_apply', { proposalId: proposal.id, changes: [{ path: 'code.txt', beforeHash: before.hash, content: 'bad' }] }), /approval/i)
-    proposal = await call('workflow_propose', { summary: 'Add one line', paths: ['code.txt'] })
-    assert.equal((await command(`approve ${proposal.id}`)).kind, 'success')
-    const applied = await call('workflow_apply', { proposalId: proposal.id, changes: [{ path: 'code.txt', beforeHash: before.hash, content: before.content + 'approved\n' }] })
-    assert.deepEqual(applied.applied, ['code.txt'])
-    assert.equal((await call('workflow_status')).approved, false)
-    assert.equal(readFileSync(path.join(fixture.root, 'code.txt'), 'utf8'), 'user content\napproved\n')
-    assert.equal((await command('resume plugin-test')).kind, 'success')
-    assert.equal((await call('workflow_status')).approved, false)
-    const retained = tools.get('workflow_apply')!
-    dispose()
-    assert.equal(tools.size, 0); assert.equal(commands.size, 0)
-    await assert.rejects(retained.execute({ proposalId: 'fake', changes: [] }, { agent, signal } as unknown as ToolRunContext), /disposed/)
-  } finally { if (tools.size) dispose(); fixture.cleanup() }
+  assert.equal(decide({ name: 'str_replace_editor', arguments: { command: 'view', path: path.join(workspace, 'src/a.ts') } }, locked), undefined)
 })
 
-test('unsupported host fails before exposing tools', () => {
-  assert.throws(() => apply({ tools: {} } as unknown as WorkflowHost), /guard/)
+test('stage documents are writable in the staging directory before approval', () => {
+  assert.equal(decide({ name: 'write', arguments: { file_path: path.join(staging, 'intake.md') } }, locked), undefined)
 })
 
-test('pending directory resolution cannot replace another command or bind after unload', async () => {
-  let handler: CommandDefinition['handler'] = () => ({ kind: 'error', text: 'unregistered' }), release: (root: string) => void = () => {}
-  const waiting = new Promise<string>((resolve) => { release = resolve })
-  const dispose = apply({
-    tools: { guard: () => () => {}, register: () => () => {} },
-    commands: { register: (value) => { handler = value.handler; return () => {} } },
-    workingDirectory: { ensure: () => waiting }, effect: (setup) => setup(),
-  })
-  const invocation = { agent: { id: 'pending-agent' }, signal: new AbortController().signal }
-  const pending = handler({ ...invocation, rawInput: 'resume example-task' })
-  assert.equal((await handler({ ...invocation, rawInput: 'resume other-task' })).kind, 'error')
-  dispose(); release('.')
-  assert.match((await pending).text, /disposed/)
+test('repository writes and commands are denied before approval', () => {
+  assert.equal(decide({ name: 'edit', arguments: { file_path: path.join(workspace, 'src/a.ts') } }, locked), DENIED)
+  assert.equal(decide({ name: 'bash', arguments: { command: 'git status' } }, locked), DENIED)
+})
+
+test('approval never opens native repository writes or arbitrary commands', () => {
+  for (const name of ['write', 'edit', 'bash', 'pwsh', 'unknown-tool']) {
+    assert.equal(decide({ name, arguments: { file_path: 'src/a.ts', command: 'write anywhere' } }, locked), DENIED)
+  }
+  assert.equal(decide({ name: 'unknown-tool', arguments: { path: path.join(staging, 'intake.md') } }, locked), DENIED)
+})
+
+test('paused staging and hardlinks cannot bypass Core', () => {
+  assert.equal(decide({ name: 'write', arguments: { file_path: path.join(staging, 'intake.md') } }, { ...locked, paused: true }), DENIED)
+  const original = path.join(staging, 'original.txt')
+  writeFileSync(original, 'protected')
+  linkSync(original, path.join(staging, 'review.md'))
+  assert.match(String(decide({ name: 'edit', arguments: { file_path: path.join(staging, 'review.md') } }, locked)), /链接/)
+})
+
+test('inside() rejects sibling prefixes', () => {
+  assert.ok(inside(path.resolve('/tmp/x'), path.resolve('/tmp/x/a')))
+  assert.ok(!inside(path.resolve('/tmp/x'), path.resolve('/tmp/xy/a')))
+})
+
+const spec = (extra: string): string => `---\ntask_id: task-1\nentry_mode: pool\nsource_type: jackyun-mcp\nspec_level: M\nstatus: confirmed\ncreated_at: 2026-11-19T09:00:00Z\n${extra}---\n# Spec\n`
+
+test('spec.md without frontmatter is rejected before it can poison the task', () => {
+  assert.throws(() => precheck(new Map([['spec.md', '# Spec\n']]), 'task-1'), /frontmatter/)
+  assert.throws(() => precheck(new Map([['spec.md', spec('')]]), 'task-2'), /task_id 必须是 task-2/)
+})
+
+test('contract_version and verification.json must be declared together and agree', () => {
+  const files = (version: string, schemaVersion: string): Map<string, string> =>
+    new Map([['spec.md', spec(`contract_version: ${version}\n`)], ['verification.json', JSON.stringify({ schemaVersion })]])
+  assert.doesNotThrow(() => precheck(files('2', '2'), 'task-1'))
+  assert.throws(() => precheck(new Map([['spec.md', spec('contract_version: 2\n')]]), 'task-1'), /verification\.json/)
+  assert.throws(() => precheck(new Map([['spec.md', spec('')], ['verification.json', '{"schemaVersion":2}']]), 'task-1'), /contract_version/)
+  assert.throws(() => precheck(files('2', '1'), 'task-1'), /schemaVersion 必须是 2/)
 })

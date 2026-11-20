@@ -1,0 +1,9 @@
+# Trusted deployment example; replace absolute paths with the installed artifact location.
+# Configure only checks permitted by the target repository AGENTS.md.
+checks:
+  - id: changed-js-syntax
+    command: 'C:\Program Files\nodejs\node.exe'
+    args: ['D:\trusted-workflow\deploy\check-changed-js.mjs']
+    timeoutMs: 120000
+    testId: VT1
+maxCorrections: 2
